@@ -15,7 +15,7 @@ import {
   GROUPS_DIR,
   IDLE_TIMEOUT,
 } from './config.js';
-import { readEnvFile } from './env.js';
+import { readEnvFile, readEnvFileAll } from './env.js';
 import { logger } from './logger.js';
 import { CONTAINER_RUNTIME_BIN, readonlyMountArgs, stopContainer } from './container-runtime.js';
 import { validateAdditionalMounts } from './mount-security.js';
@@ -179,10 +179,21 @@ function buildVolumeMounts(
 
 /**
  * Read allowed secrets from .env for passing to the container via stdin.
+ * Also loads from ~/.env.minimax if it exists (for MiniMax or other provider configs).
  * Secrets are never written to disk or mounted as files.
  */
 function readSecrets(): Record<string, string> {
-  return readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY']);
+  // Start with standard Claude credentials from project .env
+  const secrets = readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY']);
+
+  // Load all variables from ~/.env.minimax if it exists
+  // This allows using MiniMax or other Anthropic-compatible providers
+  const homeDir = getHomeDir();
+  const minimaxEnvPath = path.join(homeDir, '.env.minimax');
+  const minimaxEnv = readEnvFileAll(minimaxEnvPath);
+
+  // Merge: MiniMax env vars override project .env
+  return { ...secrets, ...minimaxEnv };
 }
 
 function buildContainerArgs(mounts: VolumeMount[], containerName: string): string[] {
