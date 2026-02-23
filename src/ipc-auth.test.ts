@@ -1,43 +1,102 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-import {
-  _initTestDatabase,
-  createTask,
-  getAllTasks,
-  getRegisteredGroup,
-  getTaskById,
-  setRegisteredGroup,
-} from './db.js';
+// In-memory store for db mock
+const store = {
+  tasks: new Map<string, {
+    taskId: string; groupFolder: string; chatJid: string; prompt: string;
+    scheduleType: string; scheduleValue: string; contextMode: string;
+    nextRun?: string; status: string; createdAt: string;
+  }>(),
+  groups: new Map<string, { jid: string; name: string; folder: string; triggerPattern: string; addedAt: string; requiresTrigger: boolean }>(),
+};
+
+vi.mock('./db.js', () => ({
+  _initTestDatabase: vi.fn(),
+  initDatabase: vi.fn(),
+  createTask: vi.fn(async (task: { id: string; group_folder: string; chat_jid: string; prompt: string; schedule_type: string; schedule_value: string; context_mode: string; next_run: string | null; status: string; created_at: string }) => {
+    store.tasks.set(task.id, {
+      taskId: task.id, groupFolder: task.group_folder, chatJid: task.chat_jid,
+      prompt: task.prompt, scheduleType: task.schedule_type, scheduleValue: task.schedule_value,
+      contextMode: task.context_mode, nextRun: task.next_run ?? undefined, status: task.status, createdAt: task.created_at,
+    });
+  }),
+  getAllTasks: vi.fn(async () => {
+    return Array.from(store.tasks.values()).map((t) => ({
+      id: t.taskId, group_folder: t.groupFolder, chat_jid: t.chatJid, prompt: t.prompt,
+      schedule_type: t.scheduleType, schedule_value: t.scheduleValue, context_mode: t.contextMode,
+      next_run: t.nextRun ?? null, last_run: null, last_result: null, status: t.status, created_at: t.createdAt,
+    }));
+  }),
+  getTaskById: vi.fn(async (id: string) => {
+    const t = store.tasks.get(id);
+    if (!t) return undefined;
+    return { id: t.taskId, group_folder: t.groupFolder, chat_jid: t.chatJid, prompt: t.prompt, schedule_type: t.scheduleType, schedule_value: t.scheduleValue, context_mode: t.contextMode, next_run: t.nextRun ?? null, last_run: null, last_result: null, status: t.status, created_at: t.createdAt };
+  }),
+  updateTask: vi.fn(async (id: string, updates: { status?: string; next_run?: string | null }) => {
+    const t = store.tasks.get(id);
+    if (t) {
+      if (updates.status !== undefined) t.status = updates.status;
+      if (updates.next_run !== undefined) t.nextRun = updates.next_run ?? undefined;
+    }
+  }),
+  deleteTask: vi.fn(async (id: string) => {
+    store.tasks.delete(id);
+  }),
+  setRegisteredGroup: vi.fn(async (jid: string, group: { name: string; folder: string; trigger: string; added_at: string; requiresTrigger?: boolean }) => {
+    store.groups.set(jid, { jid, name: group.name, folder: group.folder, triggerPattern: group.trigger, addedAt: group.added_at, requiresTrigger: group.requiresTrigger ?? true });
+  }),
+  getRegisteredGroup: vi.fn(async (jid: string) => {
+    const g = store.groups.get(jid);
+    if (!g) return undefined;
+    return { jid: g.jid, name: g.name, folder: g.folder, trigger: g.triggerPattern, added_at: g.addedAt, requiresTrigger: g.requiresTrigger };
+  }),
+  getAllRegisteredGroups: vi.fn(async () => ({})),
+  getRouterState: vi.fn(async () => null),
+  getAllSessions: vi.fn(async () => ({})),
+}));
+
+vi.mock('./config.js', () => ({
+  ASSISTANT_NAME: 'Andy',
+  ASSISTANT_HAS_OWN_NUMBER: false,
+  POLL_INTERVAL: 2000,
+  TRIGGER_PATTERN: /^@Andy\b/i,
+  MAIN_GROUP_FOLDER: 'main',
+  DATA_DIR: '/tmp',
+  STORE_DIR: '/tmp',
+  GROUPS_DIR: '/tmp/groups',
+  IDLE_TIMEOUT: 1800000,
+  MAX_CONCURRENT_CONTAINERS: 5,
+  TIMEZONE: 'UTC',
+  IPC_POLL_INTERVAL: 1000,
+}));
+
+vi.mock('./logger.js', () => ({
+  logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+}));
+
 import { processTaskIpc, IpcDeps } from './ipc.js';
+import { createTask, getAllTasks, getRegisteredGroup, getTaskById, setRegisteredGroup } from './db.js';
 import { RegisteredGroup } from './types.js';
 
 // Set up registered groups used across tests
 const MAIN_GROUP: RegisteredGroup = {
-  name: 'Main',
-  folder: 'main',
-  trigger: 'always',
-  added_at: '2024-01-01T00:00:00.000Z',
+  name: 'Main', folder: 'main', trigger: 'always', added_at: '2024-01-01T00:00:00.000Z',
 };
 
 const OTHER_GROUP: RegisteredGroup = {
-  name: 'Other',
-  folder: 'other-group',
-  trigger: '@Andy',
-  added_at: '2024-01-01T00:00:00.000Z',
+  name: 'Other', folder: 'other-group', trigger: '@Andy', added_at: '2024-01-01T00:00:00.000Z',
 };
 
 const THIRD_GROUP: RegisteredGroup = {
-  name: 'Third',
-  folder: 'third-group',
-  trigger: '@Andy',
-  added_at: '2024-01-01T00:00:00.000Z',
+  name: 'Third', folder: 'third-group', trigger: '@Andy', added_at: '2024-01-01T00:00:00.000Z',
 };
 
 let groups: Record<string, RegisteredGroup>;
 let deps: IpcDeps;
 
-beforeEach(() => {
-  _initTestDatabase();
+beforeEach(async () => {
+  store.tasks.clear();
+  store.groups.clear();
 
   groups = {
     'main@g.us': MAIN_GROUP,
@@ -45,21 +104,20 @@ beforeEach(() => {
     'third@g.us': THIRD_GROUP,
   };
 
-  // Populate DB as well
-  setRegisteredGroup('main@g.us', MAIN_GROUP);
-  setRegisteredGroup('other@g.us', OTHER_GROUP);
-  setRegisteredGroup('third@g.us', THIRD_GROUP);
+  // Populate store
+  await setRegisteredGroup('main@g.us', MAIN_GROUP);
+  await setRegisteredGroup('other@g.us', OTHER_GROUP);
+  await setRegisteredGroup('third@g.us', THIRD_GROUP);
 
   deps = {
     sendMessage: async () => {},
     registeredGroups: () => groups,
     registerGroup: (jid, group) => {
       groups[jid] = group;
-      setRegisteredGroup(jid, group);
-      // Mock the fs.mkdirSync that registerGroup does
+      setRegisteredGroup(jid, group).catch(() => {});
     },
     syncGroupMetadata: async () => {},
-    getAvailableGroups: () => [],
+    getAvailableGroups: async () => [],
     writeGroupsSnapshot: () => {},
   };
 });
@@ -69,76 +127,43 @@ beforeEach(() => {
 describe('schedule_task authorization', () => {
   it('main group can schedule for another group', async () => {
     await processTaskIpc(
-      {
-        type: 'schedule_task',
-        prompt: 'do something',
-        schedule_type: 'once',
-        schedule_value: '2025-06-01T00:00:00.000Z',
-        targetJid: 'other@g.us',
-      },
-      'main',
-      true,
-      deps,
+      { type: 'schedule_task', prompt: 'do something', schedule_type: 'once', schedule_value: '2025-06-01T00:00:00.000Z', targetJid: 'other@g.us' },
+      'main', true, deps,
     );
 
-    // Verify task was created in DB for the other group
-    const allTasks = getAllTasks();
+    const allTasks = await getAllTasks();
     expect(allTasks.length).toBe(1);
     expect(allTasks[0].group_folder).toBe('other-group');
   });
 
   it('non-main group can schedule for itself', async () => {
     await processTaskIpc(
-      {
-        type: 'schedule_task',
-        prompt: 'self task',
-        schedule_type: 'once',
-        schedule_value: '2025-06-01T00:00:00.000Z',
-        targetJid: 'other@g.us',
-      },
-      'other-group',
-      false,
-      deps,
+      { type: 'schedule_task', prompt: 'self task', schedule_type: 'once', schedule_value: '2025-06-01T00:00:00.000Z', targetJid: 'other@g.us' },
+      'other-group', false, deps,
     );
 
-    const allTasks = getAllTasks();
+    const allTasks = await getAllTasks();
     expect(allTasks.length).toBe(1);
     expect(allTasks[0].group_folder).toBe('other-group');
   });
 
   it('non-main group cannot schedule for another group', async () => {
     await processTaskIpc(
-      {
-        type: 'schedule_task',
-        prompt: 'unauthorized',
-        schedule_type: 'once',
-        schedule_value: '2025-06-01T00:00:00.000Z',
-        targetJid: 'main@g.us',
-      },
-      'other-group',
-      false,
-      deps,
+      { type: 'schedule_task', prompt: 'unauthorized', schedule_type: 'once', schedule_value: '2025-06-01T00:00:00.000Z', targetJid: 'main@g.us' },
+      'other-group', false, deps,
     );
 
-    const allTasks = getAllTasks();
+    const allTasks = await getAllTasks();
     expect(allTasks.length).toBe(0);
   });
 
   it('rejects schedule_task for unregistered target JID', async () => {
     await processTaskIpc(
-      {
-        type: 'schedule_task',
-        prompt: 'no target',
-        schedule_type: 'once',
-        schedule_value: '2025-06-01T00:00:00.000Z',
-        targetJid: 'unknown@g.us',
-      },
-      'main',
-      true,
-      deps,
+      { type: 'schedule_task', prompt: 'no target', schedule_type: 'once', schedule_value: '2025-06-01T00:00:00.000Z', targetJid: 'unknown@g.us' },
+      'main', true, deps,
     );
 
-    const allTasks = getAllTasks();
+    const allTasks = await getAllTasks();
     expect(allTasks.length).toBe(0);
   });
 });
@@ -146,80 +171,47 @@ describe('schedule_task authorization', () => {
 // --- pause_task authorization ---
 
 describe('pause_task authorization', () => {
-  beforeEach(() => {
-    createTask({
-      id: 'task-main',
-      group_folder: 'main',
-      chat_jid: 'main@g.us',
-      prompt: 'main task',
-      schedule_type: 'once',
-      schedule_value: '2025-06-01T00:00:00.000Z',
-      context_mode: 'isolated',
-      next_run: '2025-06-01T00:00:00.000Z',
-      status: 'active',
-      created_at: '2024-01-01T00:00:00.000Z',
-    });
-    createTask({
-      id: 'task-other',
-      group_folder: 'other-group',
-      chat_jid: 'other@g.us',
-      prompt: 'other task',
-      schedule_type: 'once',
-      schedule_value: '2025-06-01T00:00:00.000Z',
-      context_mode: 'isolated',
-      next_run: '2025-06-01T00:00:00.000Z',
-      status: 'active',
-      created_at: '2024-01-01T00:00:00.000Z',
-    });
+  beforeEach(async () => {
+    await createTask({ id: 'task-main', group_folder: 'main', chat_jid: 'main@g.us', prompt: 'main task', schedule_type: 'once', schedule_value: '2025-06-01T00:00:00.000Z', context_mode: 'isolated', next_run: '2025-06-01T00:00:00.000Z', status: 'active', created_at: '2024-01-01T00:00:00.000Z' });
+    await createTask({ id: 'task-other', group_folder: 'other-group', chat_jid: 'other@g.us', prompt: 'other task', schedule_type: 'once', schedule_value: '2025-06-01T00:00:00.000Z', context_mode: 'isolated', next_run: '2025-06-01T00:00:00.000Z', status: 'active', created_at: '2024-01-01T00:00:00.000Z' });
   });
 
   it('main group can pause any task', async () => {
     await processTaskIpc({ type: 'pause_task', taskId: 'task-other' }, 'main', true, deps);
-    expect(getTaskById('task-other')!.status).toBe('paused');
+    expect((await getTaskById('task-other'))!.status).toBe('paused');
   });
 
   it('non-main group can pause its own task', async () => {
     await processTaskIpc({ type: 'pause_task', taskId: 'task-other' }, 'other-group', false, deps);
-    expect(getTaskById('task-other')!.status).toBe('paused');
+    expect((await getTaskById('task-other'))!.status).toBe('paused');
   });
 
   it('non-main group cannot pause another groups task', async () => {
     await processTaskIpc({ type: 'pause_task', taskId: 'task-main' }, 'other-group', false, deps);
-    expect(getTaskById('task-main')!.status).toBe('active');
+    expect((await getTaskById('task-main'))!.status).toBe('active');
   });
 });
 
 // --- resume_task authorization ---
 
 describe('resume_task authorization', () => {
-  beforeEach(() => {
-    createTask({
-      id: 'task-paused',
-      group_folder: 'other-group',
-      chat_jid: 'other@g.us',
-      prompt: 'paused task',
-      schedule_type: 'once',
-      schedule_value: '2025-06-01T00:00:00.000Z',
-      context_mode: 'isolated',
-      next_run: '2025-06-01T00:00:00.000Z',
-      status: 'paused',
-      created_at: '2024-01-01T00:00:00.000Z',
-    });
+  beforeEach(async () => {
+    await createTask({ id: 'task-paused', group_folder: 'other-group', chat_jid: 'other@g.us', prompt: 'paused task', schedule_type: 'once', schedule_value: '2025-06-01T00:00:00.000Z', context_mode: 'isolated', next_run: '2025-06-01T00:00:00.000Z', status: 'paused', created_at: '2024-01-01T00:00:00.000Z' });
   });
 
   it('main group can resume any task', async () => {
     await processTaskIpc({ type: 'resume_task', taskId: 'task-paused' }, 'main', true, deps);
-    expect(getTaskById('task-paused')!.status).toBe('active');
+    expect((await getTaskById('task-paused'))!.status).toBe('active');
   });
 
   it('non-main group can resume its own task', async () => {
     await processTaskIpc({ type: 'resume_task', taskId: 'task-paused' }, 'other-group', false, deps);
-    expect(getTaskById('task-paused')!.status).toBe('active');
+    expect((await getTaskById('task-paused'))!.status).toBe('active');
   });
 
   it('non-main group cannot resume another groups task', async () => {
     await processTaskIpc({ type: 'resume_task', taskId: 'task-paused' }, 'third-group', false, deps);
-    expect(getTaskById('task-paused')!.status).toBe('paused');
+    expect((await getTaskById('task-paused'))!.status).toBe('paused');
   });
 });
 
@@ -227,57 +219,21 @@ describe('resume_task authorization', () => {
 
 describe('cancel_task authorization', () => {
   it('main group can cancel any task', async () => {
-    createTask({
-      id: 'task-to-cancel',
-      group_folder: 'other-group',
-      chat_jid: 'other@g.us',
-      prompt: 'cancel me',
-      schedule_type: 'once',
-      schedule_value: '2025-06-01T00:00:00.000Z',
-      context_mode: 'isolated',
-      next_run: null,
-      status: 'active',
-      created_at: '2024-01-01T00:00:00.000Z',
-    });
-
+    await createTask({ id: 'task-to-cancel', group_folder: 'other-group', chat_jid: 'other@g.us', prompt: 'cancel me', schedule_type: 'once', schedule_value: '2025-06-01T00:00:00.000Z', context_mode: 'isolated', next_run: null, status: 'active', created_at: '2024-01-01T00:00:00.000Z' });
     await processTaskIpc({ type: 'cancel_task', taskId: 'task-to-cancel' }, 'main', true, deps);
-    expect(getTaskById('task-to-cancel')).toBeUndefined();
+    expect(await getTaskById('task-to-cancel')).toBeUndefined();
   });
 
   it('non-main group can cancel its own task', async () => {
-    createTask({
-      id: 'task-own',
-      group_folder: 'other-group',
-      chat_jid: 'other@g.us',
-      prompt: 'my task',
-      schedule_type: 'once',
-      schedule_value: '2025-06-01T00:00:00.000Z',
-      context_mode: 'isolated',
-      next_run: null,
-      status: 'active',
-      created_at: '2024-01-01T00:00:00.000Z',
-    });
-
+    await createTask({ id: 'task-own', group_folder: 'other-group', chat_jid: 'other@g.us', prompt: 'my task', schedule_type: 'once', schedule_value: '2025-06-01T00:00:00.000Z', context_mode: 'isolated', next_run: null, status: 'active', created_at: '2024-01-01T00:00:00.000Z' });
     await processTaskIpc({ type: 'cancel_task', taskId: 'task-own' }, 'other-group', false, deps);
-    expect(getTaskById('task-own')).toBeUndefined();
+    expect(await getTaskById('task-own')).toBeUndefined();
   });
 
   it('non-main group cannot cancel another groups task', async () => {
-    createTask({
-      id: 'task-foreign',
-      group_folder: 'main',
-      chat_jid: 'main@g.us',
-      prompt: 'not yours',
-      schedule_type: 'once',
-      schedule_value: '2025-06-01T00:00:00.000Z',
-      context_mode: 'isolated',
-      next_run: null,
-      status: 'active',
-      created_at: '2024-01-01T00:00:00.000Z',
-    });
-
+    await createTask({ id: 'task-foreign', group_folder: 'main', chat_jid: 'main@g.us', prompt: 'not yours', schedule_type: 'once', schedule_value: '2025-06-01T00:00:00.000Z', context_mode: 'isolated', next_run: null, status: 'active', created_at: '2024-01-01T00:00:00.000Z' });
     await processTaskIpc({ type: 'cancel_task', taskId: 'task-foreign' }, 'other-group', false, deps);
-    expect(getTaskById('task-foreign')).toBeDefined();
+    expect(await getTaskById('task-foreign')).toBeDefined();
   });
 });
 
@@ -286,19 +242,9 @@ describe('cancel_task authorization', () => {
 describe('register_group authorization', () => {
   it('non-main group cannot register a group', async () => {
     await processTaskIpc(
-      {
-        type: 'register_group',
-        jid: 'new@g.us',
-        name: 'New Group',
-        folder: 'new-group',
-        trigger: '@Andy',
-      },
-      'other-group',
-      false,
-      deps,
+      { type: 'register_group', jid: 'new@g.us', name: 'New Group', folder: 'new-group', trigger: '@Andy' },
+      'other-group', false, deps,
     );
-
-    // registeredGroups should not have changed
     expect(groups['new@g.us']).toBeUndefined();
   });
 
@@ -324,22 +270,15 @@ describe('register_group authorization', () => {
 
 describe('refresh_groups authorization', () => {
   it('non-main group cannot trigger refresh', async () => {
-    // This should be silently blocked (no crash, no effect)
     await processTaskIpc({ type: 'refresh_groups' }, 'other-group', false, deps);
-    // If we got here without error, the auth gate worked
   });
 });
 
 // --- IPC message authorization ---
-// Tests the authorization pattern from startIpcWatcher (ipc.ts).
-// The logic: isMain || (targetGroup && targetGroup.folder === sourceGroup)
 
 describe('IPC message authorization', () => {
-  // Replicate the exact check from the IPC watcher
   function isMessageAuthorized(
-    sourceGroup: string,
-    isMain: boolean,
-    targetChatJid: string,
+    sourceGroup: string, isMain: boolean, targetChatJid: string,
     registeredGroups: Record<string, RegisteredGroup>,
   ): boolean {
     const targetGroup = registeredGroups[targetChatJid];
@@ -365,7 +304,6 @@ describe('IPC message authorization', () => {
   });
 
   it('main group can send to unregistered JID', () => {
-    // Main is always authorized regardless of target
     expect(isMessageAuthorized('main', true, 'unknown@g.us', groups)).toBe(true);
   });
 });
@@ -375,63 +313,35 @@ describe('IPC message authorization', () => {
 describe('schedule_task schedule types', () => {
   it('creates task with cron schedule and computes next_run', async () => {
     await processTaskIpc(
-      {
-        type: 'schedule_task',
-        prompt: 'cron task',
-        schedule_type: 'cron',
-        schedule_value: '0 9 * * *', // every day at 9am
-        targetJid: 'other@g.us',
-      },
-      'main',
-      true,
-      deps,
+      { type: 'schedule_task', prompt: 'cron task', schedule_type: 'cron', schedule_value: '0 9 * * *', targetJid: 'other@g.us' },
+      'main', true, deps,
     );
 
-    const tasks = getAllTasks();
+    const tasks = await getAllTasks();
     expect(tasks).toHaveLength(1);
     expect(tasks[0].schedule_type).toBe('cron');
     expect(tasks[0].next_run).toBeTruthy();
-    // next_run should be a valid ISO date in the future
     expect(new Date(tasks[0].next_run!).getTime()).toBeGreaterThan(Date.now() - 60000);
   });
 
   it('rejects invalid cron expression', async () => {
     await processTaskIpc(
-      {
-        type: 'schedule_task',
-        prompt: 'bad cron',
-        schedule_type: 'cron',
-        schedule_value: 'not a cron',
-        targetJid: 'other@g.us',
-      },
-      'main',
-      true,
-      deps,
+      { type: 'schedule_task', prompt: 'bad cron', schedule_type: 'cron', schedule_value: 'not a cron', targetJid: 'other@g.us' },
+      'main', true, deps,
     );
-
-    expect(getAllTasks()).toHaveLength(0);
+    expect(await getAllTasks()).toHaveLength(0);
   });
 
   it('creates task with interval schedule', async () => {
     const before = Date.now();
-
     await processTaskIpc(
-      {
-        type: 'schedule_task',
-        prompt: 'interval task',
-        schedule_type: 'interval',
-        schedule_value: '3600000', // 1 hour
-        targetJid: 'other@g.us',
-      },
-      'main',
-      true,
-      deps,
+      { type: 'schedule_task', prompt: 'interval task', schedule_type: 'interval', schedule_value: '3600000', targetJid: 'other@g.us' },
+      'main', true, deps,
     );
 
-    const tasks = getAllTasks();
+    const tasks = await getAllTasks();
     expect(tasks).toHaveLength(1);
     expect(tasks[0].schedule_type).toBe('interval');
-    // next_run should be ~1 hour from now
     const nextRun = new Date(tasks[0].next_run!).getTime();
     expect(nextRun).toBeGreaterThanOrEqual(before + 3600000 - 1000);
     expect(nextRun).toBeLessThanOrEqual(Date.now() + 3600000 + 1000);
@@ -439,53 +349,26 @@ describe('schedule_task schedule types', () => {
 
   it('rejects invalid interval (non-numeric)', async () => {
     await processTaskIpc(
-      {
-        type: 'schedule_task',
-        prompt: 'bad interval',
-        schedule_type: 'interval',
-        schedule_value: 'abc',
-        targetJid: 'other@g.us',
-      },
-      'main',
-      true,
-      deps,
+      { type: 'schedule_task', prompt: 'bad interval', schedule_type: 'interval', schedule_value: 'abc', targetJid: 'other@g.us' },
+      'main', true, deps,
     );
-
-    expect(getAllTasks()).toHaveLength(0);
+    expect(await getAllTasks()).toHaveLength(0);
   });
 
   it('rejects invalid interval (zero)', async () => {
     await processTaskIpc(
-      {
-        type: 'schedule_task',
-        prompt: 'zero interval',
-        schedule_type: 'interval',
-        schedule_value: '0',
-        targetJid: 'other@g.us',
-      },
-      'main',
-      true,
-      deps,
+      { type: 'schedule_task', prompt: 'zero interval', schedule_type: 'interval', schedule_value: '0', targetJid: 'other@g.us' },
+      'main', true, deps,
     );
-
-    expect(getAllTasks()).toHaveLength(0);
+    expect(await getAllTasks()).toHaveLength(0);
   });
 
   it('rejects invalid once timestamp', async () => {
     await processTaskIpc(
-      {
-        type: 'schedule_task',
-        prompt: 'bad once',
-        schedule_type: 'once',
-        schedule_value: 'not-a-date',
-        targetJid: 'other@g.us',
-      },
-      'main',
-      true,
-      deps,
+      { type: 'schedule_task', prompt: 'bad once', schedule_type: 'once', schedule_value: 'not-a-date', targetJid: 'other@g.us' },
+      'main', true, deps,
     );
-
-    expect(getAllTasks()).toHaveLength(0);
+    expect(await getAllTasks()).toHaveLength(0);
   });
 });
 
@@ -494,76 +377,38 @@ describe('schedule_task schedule types', () => {
 describe('schedule_task context_mode', () => {
   it('accepts context_mode=group', async () => {
     await processTaskIpc(
-      {
-        type: 'schedule_task',
-        prompt: 'group context',
-        schedule_type: 'once',
-        schedule_value: '2025-06-01T00:00:00.000Z',
-        context_mode: 'group',
-        targetJid: 'other@g.us',
-      },
-      'main',
-      true,
-      deps,
+      { type: 'schedule_task', prompt: 'group context', schedule_type: 'once', schedule_value: '2025-06-01T00:00:00.000Z', context_mode: 'group', targetJid: 'other@g.us' },
+      'main', true, deps,
     );
-
-    const tasks = getAllTasks();
+    const tasks = await getAllTasks();
     expect(tasks[0].context_mode).toBe('group');
   });
 
   it('accepts context_mode=isolated', async () => {
     await processTaskIpc(
-      {
-        type: 'schedule_task',
-        prompt: 'isolated context',
-        schedule_type: 'once',
-        schedule_value: '2025-06-01T00:00:00.000Z',
-        context_mode: 'isolated',
-        targetJid: 'other@g.us',
-      },
-      'main',
-      true,
-      deps,
+      { type: 'schedule_task', prompt: 'isolated context', schedule_type: 'once', schedule_value: '2025-06-01T00:00:00.000Z', context_mode: 'isolated', targetJid: 'other@g.us' },
+      'main', true, deps,
     );
-
-    const tasks = getAllTasks();
+    const tasks = await getAllTasks();
     expect(tasks[0].context_mode).toBe('isolated');
   });
 
   it('defaults invalid context_mode to isolated', async () => {
     await processTaskIpc(
-      {
-        type: 'schedule_task',
-        prompt: 'bad context',
-        schedule_type: 'once',
-        schedule_value: '2025-06-01T00:00:00.000Z',
-        context_mode: 'bogus' as any,
-        targetJid: 'other@g.us',
-      },
-      'main',
-      true,
-      deps,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      { type: 'schedule_task', prompt: 'bad context', schedule_type: 'once', schedule_value: '2025-06-01T00:00:00.000Z', context_mode: 'bogus' as any, targetJid: 'other@g.us' },
+      'main', true, deps,
     );
-
-    const tasks = getAllTasks();
+    const tasks = await getAllTasks();
     expect(tasks[0].context_mode).toBe('isolated');
   });
 
   it('defaults missing context_mode to isolated', async () => {
     await processTaskIpc(
-      {
-        type: 'schedule_task',
-        prompt: 'no context mode',
-        schedule_type: 'once',
-        schedule_value: '2025-06-01T00:00:00.000Z',
-        targetJid: 'other@g.us',
-      },
-      'main',
-      true,
-      deps,
+      { type: 'schedule_task', prompt: 'no context mode', schedule_type: 'once', schedule_value: '2025-06-01T00:00:00.000Z', targetJid: 'other@g.us' },
+      'main', true, deps,
     );
-
-    const tasks = getAllTasks();
+    const tasks = await getAllTasks();
     expect(tasks[0].context_mode).toBe('isolated');
   });
 });
@@ -573,20 +418,11 @@ describe('schedule_task context_mode', () => {
 describe('register_group success', () => {
   it('main group can register a new group', async () => {
     await processTaskIpc(
-      {
-        type: 'register_group',
-        jid: 'new@g.us',
-        name: 'New Group',
-        folder: 'new-group',
-        trigger: '@Andy',
-      },
-      'main',
-      true,
-      deps,
+      { type: 'register_group', jid: 'new@g.us', name: 'New Group', folder: 'new-group', trigger: '@Andy' },
+      'main', true, deps,
     );
 
-    // Verify group was registered in DB
-    const group = getRegisteredGroup('new@g.us');
+    const group = await getRegisteredGroup('new@g.us');
     expect(group).toBeDefined();
     expect(group!.name).toBe('New Group');
     expect(group!.folder).toBe('new-group');
@@ -595,17 +431,9 @@ describe('register_group success', () => {
 
   it('register_group rejects request with missing fields', async () => {
     await processTaskIpc(
-      {
-        type: 'register_group',
-        jid: 'partial@g.us',
-        name: 'Partial',
-        // missing folder and trigger
-      },
-      'main',
-      true,
-      deps,
+      { type: 'register_group', jid: 'partial@g.us', name: 'Partial' },
+      'main', true, deps,
     );
-
-    expect(getRegisteredGroup('partial@g.us')).toBeUndefined();
+    expect(await getRegisteredGroup('partial@g.us')).toBeUndefined();
   });
 });

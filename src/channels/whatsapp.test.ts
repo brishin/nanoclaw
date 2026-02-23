@@ -22,9 +22,9 @@ vi.mock('../logger.js', () => ({
 
 // Mock db
 vi.mock('../db.js', () => ({
-  getLastGroupSync: vi.fn(() => null),
-  setLastGroupSync: vi.fn(),
-  updateChatName: vi.fn(),
+  getLastGroupSync: vi.fn(async () => null),
+  setLastGroupSync: vi.fn(async () => {}),
+  updateChatName: vi.fn(async () => {}),
 }));
 
 // Mock fs
@@ -140,7 +140,7 @@ async function triggerMessages(messages: unknown[]) {
 describe('WhatsAppChannel', () => {
   beforeEach(() => {
     fakeSocket = createFakeSocket();
-    vi.mocked(getLastGroupSync).mockReturnValue(null);
+    vi.mocked(getLastGroupSync).mockResolvedValue(null);
   });
 
   afterEach(() => {
@@ -744,7 +744,7 @@ describe('WhatsAppChannel', () => {
 
     it('skips sync when synced recently', async () => {
       // Last sync was 1 hour ago (within 24h threshold)
-      vi.mocked(getLastGroupSync).mockReturnValue(
+      vi.mocked(getLastGroupSync).mockResolvedValue(
         new Date(Date.now() - 60 * 60 * 1000).toISOString(),
       );
 
@@ -759,7 +759,7 @@ describe('WhatsAppChannel', () => {
     });
 
     it('forces sync regardless of cache', async () => {
-      vi.mocked(getLastGroupSync).mockReturnValue(
+      vi.mocked(getLastGroupSync).mockResolvedValue(
         new Date(Date.now() - 60 * 60 * 1000).toISOString(),
       );
 
