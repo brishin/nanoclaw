@@ -191,6 +191,7 @@ vi.mock('convex/server', () => {
         return new Proxy({ _path: String(prop) }, handler);
       },
     }),
+    componentsGeneric: () => ({}),
   };
 });
 

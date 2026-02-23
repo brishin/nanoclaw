@@ -2,6 +2,8 @@ import { ConvexClient } from 'convex/browser';
 import { api } from '../convex/_generated/api.js';
 
 import { ASSISTANT_NAME, CONVEX_URL } from './config.js';
+import { isValidGroupFolder } from './group-folder.js';
+import { logger } from './logger.js';
 import { NewMessage, RegisteredGroup, ScheduledTask, TaskRunLog } from './types.js';
 
 let client: ConvexClient;
@@ -202,6 +204,14 @@ export async function getRegisteredGroup(
   jid: string,
 ): Promise<(RegisteredGroup & { jid: string }) | undefined> {
   const result = await client.query(api.groups.getRegisteredGroup, { jid });
+  if (!result) return undefined;
+  if (!isValidGroupFolder(result.folder)) {
+    logger.warn(
+      { jid: result.jid, folder: result.folder },
+      'Skipping registered group with invalid folder',
+    );
+    return undefined;
+  }
   return result ?? undefined;
 }
 
@@ -209,6 +219,9 @@ export async function setRegisteredGroup(
   jid: string,
   group: RegisteredGroup,
 ): Promise<void> {
+  if (!isValidGroupFolder(group.folder)) {
+    throw new Error(`Invalid group folder "${group.folder}" for JID ${jid}`);
+  }
   await client.mutation(api.groups.setRegisteredGroup, {
     jid,
     name: group.name,
@@ -226,6 +239,13 @@ export async function getAllRegisteredGroups(): Promise<Record<string, Registere
   const rows = await client.query(api.groups.getAllRegisteredGroups, {});
   const result: Record<string, RegisteredGroup> = {};
   for (const row of rows) {
+    if (!isValidGroupFolder(row.folder)) {
+      logger.warn(
+        { jid: row.jid, folder: row.folder },
+        'Skipping registered group with invalid folder',
+      );
+      continue;
+    }
     result[row.jid] = {
       name: row.name,
       folder: row.folder,
