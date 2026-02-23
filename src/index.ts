@@ -6,7 +6,6 @@ import {
   DATA_DIR,
   IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
-  POLL_INTERVAL,
   TRIGGER_PATTERN,
 } from './config.js';
 import { WhatsAppChannel } from './channels/whatsapp.js';
@@ -23,7 +22,6 @@ import {
   getAllSessions,
   getAllTasks,
   getMessagesSince,
-  getNewMessages,
   getRouterState,
   initDatabase,
   setRegisteredGroup,
@@ -31,6 +29,7 @@ import {
   setSession,
   storeChatMetadata,
   storeMessage,
+  subscribeToNewMessages,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { startIpcWatcher } from './ipc.js';
@@ -47,22 +46,23 @@ let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
+let resetMessageSubscription: (() => void) | null = null;
 
 let whatsapp: WhatsAppChannel;
 const channels: Channel[] = [];
 const queue = new GroupQueue();
 
-function loadState(): void {
-  lastTimestamp = getRouterState('last_timestamp') || '';
-  const agentTs = getRouterState('last_agent_timestamp');
+async function loadState(): Promise<void> {
+  lastTimestamp = (await getRouterState('last_timestamp')) || '';
+  const agentTs = await getRouterState('last_agent_timestamp');
   try {
     lastAgentTimestamp = agentTs ? JSON.parse(agentTs) : {};
   } catch {
     logger.warn('Corrupted last_agent_timestamp in DB, resetting');
     lastAgentTimestamp = {};
   }
-  sessions = getAllSessions();
-  registeredGroups = getAllRegisteredGroups();
+  sessions = await getAllSessions();
+  registeredGroups = await getAllRegisteredGroups();
   logger.info(
     { groupCount: Object.keys(registeredGroups).length },
     'State loaded',
@@ -70,16 +70,22 @@ function loadState(): void {
 }
 
 function saveState(): void {
-  setRouterState('last_timestamp', lastTimestamp);
+  setRouterState('last_timestamp', lastTimestamp).catch((err) =>
+    logger.error({ err }, 'Failed to save last_timestamp'),
+  );
   setRouterState(
     'last_agent_timestamp',
     JSON.stringify(lastAgentTimestamp),
+  ).catch((err) =>
+    logger.error({ err }, 'Failed to save last_agent_timestamp'),
   );
 }
 
 function registerGroup(jid: string, group: RegisteredGroup): void {
   registeredGroups[jid] = group;
-  setRegisteredGroup(jid, group);
+  setRegisteredGroup(jid, group).catch((err) =>
+    logger.error({ err, jid }, 'Failed to persist registered group'),
+  );
 
   // Create group folder
   const groupDir = path.join(DATA_DIR, '..', 'groups', group.folder);
@@ -89,14 +95,17 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
     { jid, name: group.name, folder: group.folder },
     'Group registered',
   );
+
+  // Re-subscribe with updated jids list
+  resetMessageSubscription?.();
 }
 
 /**
  * Get available groups list for the agent.
  * Returns groups ordered by most recent activity.
  */
-export function getAvailableGroups(): import('./container-runner.js').AvailableGroup[] {
-  const chats = getAllChats();
+export async function getAvailableGroups(): Promise<import('./container-runner.js').AvailableGroup[]> {
+  const chats = await getAllChats();
   const registeredJids = new Set(Object.keys(registeredGroups));
 
   return chats
@@ -131,7 +140,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
 
   const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
-  const missedMessages = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
+  const missedMessages = await getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
 
   if (missedMessages.length === 0) return true;
 
@@ -222,7 +231,7 @@ async function runAgent(
   const sessionId = sessions[group.folder];
 
   // Update tasks snapshot for container to read (filtered by group)
-  const tasks = getAllTasks();
+  const tasks = await getAllTasks();
   writeTasksSnapshot(
     group.folder,
     isMain,
@@ -238,7 +247,7 @@ async function runAgent(
   );
 
   // Update available groups snapshot (main group only can see all groups)
-  const availableGroups = getAvailableGroups();
+  const availableGroups = await getAvailableGroups();
   writeGroupsSnapshot(
     group.folder,
     isMain,
@@ -251,7 +260,9 @@ async function runAgent(
     ? async (output: ContainerOutput) => {
         if (output.newSessionId) {
           sessions[group.folder] = output.newSessionId;
-          setSession(group.folder, output.newSessionId);
+          setSession(group.folder, output.newSessionId).catch((err) =>
+            logger.error({ err }, 'Failed to persist session'),
+          );
         }
         await onOutput(output);
       }
@@ -273,7 +284,9 @@ async function runAgent(
 
     if (output.newSessionId) {
       sessions[group.folder] = output.newSessionId;
-      setSession(group.folder, output.newSessionId);
+      setSession(group.folder, output.newSessionId).catch((err) =>
+        logger.error({ err }, 'Failed to persist session'),
+      );
     }
 
     if (output.status === 'error') {
@@ -300,21 +313,31 @@ async function startMessageLoop(): Promise<void> {
 
   logger.info(`NanoClaw running (trigger: @${ASSISTANT_NAME})`);
 
-  while (true) {
-    try {
-      const jids = Object.keys(registeredGroups);
-      const { messages, newTimestamp } = getNewMessages(jids, lastTimestamp, ASSISTANT_NAME);
+  let activeUnsubscribe: (() => void) | null = null;
 
-      if (messages.length > 0) {
-        logger.info({ count: messages.length }, 'New messages');
+  const setupSubscription = () => {
+    activeUnsubscribe?.();
+    const jids = Object.keys(registeredGroups);
+    if (jids.length === 0) {
+      setTimeout(setupSubscription, 2000);
+      return;
+    }
+    activeUnsubscribe = subscribeToNewMessages(
+      jids,
+      lastTimestamp,
+      ASSISTANT_NAME,
+      async (result) => {
+        if (result.messages.length === 0) return;
+
+        logger.info({ count: result.messages.length }, 'New messages');
 
         // Advance the "seen" cursor for all messages immediately
-        lastTimestamp = newTimestamp;
+        lastTimestamp = result.newTimestamp;
         saveState();
 
         // Deduplicate by group
         const messagesByGroup = new Map<string, NewMessage[]>();
-        for (const msg of messages) {
+        for (const msg of result.messages) {
           const existing = messagesByGroup.get(msg.chat_jid);
           if (existing) {
             existing.push(msg);
@@ -348,7 +371,7 @@ async function startMessageLoop(): Promise<void> {
 
           // Pull all messages since lastAgentTimestamp so non-trigger
           // context that accumulated between triggers is included.
-          const allPending = getMessagesSince(
+          const allPending = await getMessagesSince(
             chatJid,
             lastAgentTimestamp[chatJid] || '',
             ASSISTANT_NAME,
@@ -372,22 +395,26 @@ async function startMessageLoop(): Promise<void> {
             queue.enqueueMessageCheck(chatJid);
           }
         }
-      }
-    } catch (err) {
-      logger.error({ err }, 'Error in message loop');
-    }
-    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
-  }
+
+        // Re-subscribe with the advanced timestamp
+        setupSubscription();
+      },
+    );
+  };
+
+  resetMessageSubscription = setupSubscription;
+  setupSubscription();
+  await new Promise(() => {}); // hold open until process exit
 }
 
 /**
  * Startup recovery: check for unprocessed messages in registered groups.
  * Handles crash between advancing lastTimestamp and processing messages.
  */
-function recoverPendingMessages(): void {
+async function recoverPendingMessages(): Promise<void> {
   for (const [chatJid, group] of Object.entries(registeredGroups)) {
     const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
-    const pending = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
+    const pending = await getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
     if (pending.length > 0) {
       logger.info(
         { group: group.name, pendingCount: pending.length },
@@ -407,7 +434,7 @@ async function main(): Promise<void> {
   ensureContainerSystemRunning();
   initDatabase();
   logger.info('Database initialized');
-  loadState();
+  await loadState();
 
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
@@ -421,9 +448,14 @@ async function main(): Promise<void> {
 
   // Channel callbacks (shared by all channels)
   const channelOpts = {
-    onMessage: (_chatJid: string, msg: NewMessage) => storeMessage(msg),
-    onChatMetadata: (chatJid: string, timestamp: string, name?: string, channel?: string, isGroup?: boolean) =>
-      storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
+    onMessage: (_chatJid: string, msg: NewMessage) => {
+      storeMessage(msg).catch((err) => logger.error({ err }, 'Failed to store message'));
+    },
+    onChatMetadata: (chatJid: string, timestamp: string, name?: string, channel?: string, isGroup?: boolean) => {
+      storeChatMetadata(chatJid, timestamp, name, channel, isGroup).catch((err) =>
+        logger.error({ err }, 'Failed to store chat metadata'),
+      );
+    },
     registeredGroups: () => registeredGroups,
   };
 
@@ -461,7 +493,7 @@ async function main(): Promise<void> {
     writeGroupsSnapshot: (gf, im, ag, rj) => writeGroupsSnapshot(gf, im, ag, rj),
   });
   queue.setProcessMessagesFn(processGroupMessages);
-  recoverPendingMessages();
+  await recoverPendingMessages();
   startMessageLoop();
 }
 

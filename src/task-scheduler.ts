@@ -42,7 +42,6 @@ async function runTask(
     { taskId: task.id, group: task.group_folder },
     'Running scheduled task',
   );
-
   const groups = deps.registeredGroups();
   const group = Object.values(groups).find(
     (g) => g.folder === task.group_folder,
@@ -53,7 +52,7 @@ async function runTask(
       { taskId: task.id, groupFolder: task.group_folder },
       'Group not found for task',
     );
-    logTaskRun({
+    await logTaskRun({
       task_id: task.id,
       run_at: new Date().toISOString(),
       duration_ms: Date.now() - startTime,
@@ -66,7 +65,7 @@ async function runTask(
 
   // Update tasks snapshot for container to read (filtered by group)
   const isMain = task.group_folder === MAIN_GROUP_FOLDER;
-  const tasks = getAllTasks();
+  const tasks = await getAllTasks();
   writeTasksSnapshot(
     task.group_folder,
     isMain,
@@ -148,7 +147,7 @@ async function runTask(
 
   const durationMs = Date.now() - startTime;
 
-  logTaskRun({
+  await logTaskRun({
     task_id: task.id,
     run_at: new Date().toISOString(),
     duration_ms: durationMs,
@@ -174,7 +173,7 @@ async function runTask(
     : result
       ? result.slice(0, 200)
       : 'Completed';
-  updateTaskAfterRun(task.id, nextRun, resultSummary);
+  await updateTaskAfterRun(task.id, nextRun, resultSummary);
 }
 
 let schedulerRunning = false;
@@ -189,14 +188,14 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
 
   const loop = async () => {
     try {
-      const dueTasks = getDueTasks();
+      const dueTasks = await getDueTasks();
       if (dueTasks.length > 0) {
         logger.info({ count: dueTasks.length }, 'Found due tasks');
       }
 
       for (const task of dueTasks) {
         // Re-check task status in case it was paused/cancelled
-        const currentTask = getTaskById(task.id);
+        const currentTask = await getTaskById(task.id);
         if (!currentTask || currentTask.status !== 'active') {
           continue;
         }
