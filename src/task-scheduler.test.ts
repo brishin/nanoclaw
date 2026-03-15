@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { makeMockConvexClient, makeMockStore, type MockStore } from './test-utils/mock-convex.js';
 import { _initTestDatabase, createTask, getTaskById } from './db.js';
 import {
   _resetSchedulerLoopForTests,
@@ -7,9 +8,33 @@ import {
   startSchedulerLoop,
 } from './task-scheduler.js';
 
+vi.mock('convex/server', () => {
+  const handler: ProxyHandler<object> = {
+    get(target: object, prop: string | symbol): unknown {
+      if (prop === '_name') return (target as { _path: string })._path;
+      return new Proxy({ _path: `${(target as { _path: string })._path}:${String(prop)}` }, handler);
+    },
+  };
+  return {
+    anyApi: new Proxy({ _path: '' }, {
+      get(_target, prop: string | symbol) {
+        return new Proxy({ _path: String(prop) }, handler);
+      },
+    }),
+    componentsGeneric: () => ({}),
+  };
+});
+
+vi.mock('convex/browser', () => ({
+  ConvexClient: vi.fn(),
+}));
+
+let store: MockStore;
+
 describe('task scheduler', () => {
   beforeEach(() => {
-    _initTestDatabase();
+    store = makeMockStore();
+    _initTestDatabase(makeMockConvexClient(store) as unknown as import('convex/browser').ConvexClient);
     _resetSchedulerLoopForTests();
     vi.useFakeTimers();
   });
@@ -19,7 +44,7 @@ describe('task scheduler', () => {
   });
 
   it('pauses due tasks with invalid group folders to prevent retry churn', async () => {
-    createTask({
+    await createTask({
       id: 'task-invalid-folder',
       group_folder: '../../outside',
       chat_jid: 'bad@g.us',
@@ -48,7 +73,7 @@ describe('task scheduler', () => {
 
     await vi.advanceTimersByTimeAsync(10);
 
-    const task = getTaskById('task-invalid-folder');
+    const task = await getTaskById('task-invalid-folder');
     expect(task?.status).toBe('paused');
   });
 
